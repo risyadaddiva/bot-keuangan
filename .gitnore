@@ -1,4 +1,3 @@
-# Python
 __pycache__/
 *.py[cod]
 *$py.class
@@ -7,18 +6,8 @@ __pycache__/
 venv/
 env/
 .env
-
-# Credentials (jangan di-upload!)
+.venv
 credentials.json
+service_account.json
 *.json
-!requirements.txt
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
+!.gitignore
