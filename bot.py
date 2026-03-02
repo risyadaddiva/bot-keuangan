@@ -61,24 +61,30 @@ def run_flask():
 # GOOGLE SHEETS SETUP
 # ============================================
 def get_credentials():
-    """Get credentials from environment variable"""
+    """Get credentials from file or environment"""
     scopes = [
         'https://www.googleapis.com/auth/spreadsheets',
         'https://www.googleapis.com/auth/drive'
     ]
     
+    # Coba baca dari file dulu (untuk Render, upload via Secret Files)
+    if os.path.exists('service_account.json'):
+        credentials = Credentials.from_service_account_file(
+            'service_account.json',
+            scopes=scopes
+        )
+        logger.info("✅ Credentials loaded from file")
+        return credentials
+    
+    # Fallback ke environment variable
     creds_json = os.environ.get("GOOGLE_CREDENTIALS")
-    
-    if not creds_json:
-        raise ValueError("GOOGLE_CREDENTIALS not found in environment variables!")
-    
-    try:
+    if creds_json:
         creds_info = json.loads(creds_json)
         credentials = Credentials.from_service_account_info(creds_info, scopes=scopes)
+        logger.info("✅ Credentials loaded from env")
         return credentials
-    except Exception as e:
-        logger.error(f"Error parsing credentials: {e}")
-        raise
+    
+    raise ValueError("No credentials found!")
 
 def setup_google_sheets():
     """Connect to Google Sheets"""
