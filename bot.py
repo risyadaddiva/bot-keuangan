@@ -1,7 +1,11 @@
 import os
 import logging
+import json
+from datetime import datetime
+from threading import Thread
+
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -13,16 +17,18 @@ from telegram.ext import (
     filters
 )
 from flask import Flask
-from threading import Thread
-import json
-from datetime import datetime
+
+# Load environment variables
+from dotenv import load_dotenv
+load_dotenv()
 
 # ============================================
 # KONFIGURASI
 # ============================================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-SPREADSHEET_NAME = "Catatan Keuangan"  # Nama spreadsheet yang sudah ada
-WORKSHEET_NAME = "Transaksi"  # Nama sheet/tab di dalam spreadsheet
+SPREADSHEET_NAME = "Catatan Keuangan"
+WORKSHEET_NAME = "Transaksi"
+PORT = int(os.environ.get("PORT", 10000))
 
 # Setup logging
 logging.basicConfig(
@@ -31,12 +37,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# States untuk ConversationHandler
+# States
 NOMINAL, KETERANGAN, KATEGORI = range(3)
 temp_data = {}
 
 # ============================================
-# FLASK APP (Untuk keep-alive dan health check)
+# FLASK KEEP-ALIVE SERVER
 # ============================================
 app = Flask(__name__)
 
@@ -46,90 +52,67 @@ def home():
 
 @app.route('/health')
 def health():
-    return {
-        "status": "ok", 
-        "timestamp": datetime.now().isoformat(),
-        "spreadsheet": SPREADSHEET_NAME
-    }
+    return {"status": "ok", "timestamp": datetime.now().isoformat()}
 
 def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
 
 # ============================================
 # GOOGLE SHEETS SETUP
 # ============================================
-def setup_google_sheets():
-    """
-    Koneksi ke Google Sheets menggunakan service account.
-    Spreadsheet harus sudah ada dengan nama "Catatan Keuangan"
-    dan sudah di-share ke service account.
-    """
-    scope = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
+def get_credentials():
+    """Get credentials from environment variable"""
+    scopes = [
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/drive'
     ]
     
-    # Load credentials dari environment variable (untuk production)
     creds_json = os.environ.get("GOOGLE_CREDENTIALS")
     
-    if creds_json:
-        # Production: load dari env variable
-        try:
-            creds_dict = json.loads(creds_json)
-            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-            logger.info("Loaded credentials from environment variable")
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON in GOOGLE_CREDENTIALS: {e}")
-            raise
-    else:
-        # Development: load dari file
-        try:
-            creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
-            logger.info("Loaded credentials from credentials.json file")
-        except FileNotFoundError:
-            logger.error("credentials.json not found and GOOGLE_CREDENTIALS not set")
-            raise
+    if not creds_json:
+        raise ValueError("GOOGLE_CREDENTIALS not found in environment variables!")
     
-    client = gspread.authorize(creds)
-    
-    # Buka spreadsheet dengan nama yang sudah ada
     try:
-        spreadsheet = client.open(SPREADSHEET_NAME)
-        logger.info(f"Successfully opened spreadsheet: {spreadsheet.title}")
-        return spreadsheet
-    except gspread.SpreadsheetNotFound:
-        logger.error(f"Spreadsheet '{SPREADSHEET_NAME}' not found!")
-        logger.error("Please ensure:")
-        logger.error("1. Spreadsheet exists with exact name 'Catatan Keuangan'")
-        logger.error("2. Service account email has been shared to the spreadsheet")
-        raise
+        creds_info = json.loads(creds_json)
+        credentials = Credentials.from_service_account_info(creds_info, scopes=scopes)
+        return credentials
     except Exception as e:
-        logger.error(f"Error opening spreadsheet: {e}")
+        logger.error(f"Error parsing credentials: {e}")
+        raise
+
+def setup_google_sheets():
+    """Connect to Google Sheets"""
+    try:
+        credentials = get_credentials()
+        client = gspread.authorize(credentials)
+        
+        try:
+            spreadsheet = client.open(SPREADSHEET_NAME)
+            logger.info(f"✅ Connected to spreadsheet: {spreadsheet.title}")
+            return spreadsheet
+        except gspread.SpreadsheetNotFound:
+            logger.error(f"❌ Spreadsheet '{SPREADSHEET_NAME}' not found!")
+            logger.error("Make sure the spreadsheet exists and is shared with the service account")
+            raise
+            
+    except Exception as e:
+        logger.error(f"❌ Failed to setup Google Sheets: {e}")
         raise
 
 def get_or_create_worksheet(spreadsheet, worksheet_name=WORKSHEET_NAME):
-    """
-    Ambil worksheet dengan nama tertentu, atau buat baru jika belum ada.
-    Jika worksheet baru dibuat, tambahkan header.
-    """
+    """Get or create worksheet"""
     try:
-        # Coba ambil worksheet yang sudah ada
         worksheet = spreadsheet.worksheet(worksheet_name)
-        logger.info(f"Using existing worksheet: {worksheet_name}")
+        logger.info(f"✅ Using worksheet: {worksheet_name}")
     except gspread.WorksheetNotFound:
-        # Buat worksheet baru jika belum ada
-        logger.info(f"Creating new worksheet: {worksheet_name}")
-        worksheet = spreadsheet.add_worksheet(
-            title=worksheet_name, 
-            rows=1000, 
-            cols=5
-        )
-        # Tambahkan header
+        logger.info(f"📝 Creating new worksheet: {worksheet_name}")
+        worksheet = spreadsheet.add_worksheet(title=worksheet_name, rows=1000, cols=5)
+        
+        # Add headers
         headers = ["Tanggal", "Tipe", "Nominal", "Kategori", "Keterangan"]
         worksheet.append_row(headers)
         
-        # Format header (bold dengan background abu)
+        # Format headers
         try:
             worksheet.format('A1:E1', {
                 'textFormat': {'bold': True},
@@ -137,9 +120,7 @@ def get_or_create_worksheet(spreadsheet, worksheet_name=WORKSHEET_NAME):
                 'horizontalAlignment': 'CENTER'
             })
         except Exception as e:
-            logger.warning(f"Could not format header: {e}")
-        
-        logger.info(f"Worksheet '{worksheet_name}' created with headers")
+            logger.warning(f"Could not format headers: {e}")
     
     return worksheet
 
@@ -147,7 +128,7 @@ def get_or_create_worksheet(spreadsheet, worksheet_name=WORKSHEET_NAME):
 # BOT HANDLERS
 # ============================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler untuk command /start"""
+    """Start command"""
     keyboard = [
         [InlineKeyboardButton("📝 Lapor Transaksi", callback_data='lapor')],
         [InlineKeyboardButton("📊 Cek Laporan", callback_data='cek')]
@@ -155,19 +136,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         "💰 *Bot Pencatatan Keuangan*\n\n"
-        "Selamat datang! Bot ini akan membantu mencatat pemasukan dan pengeluaran Anda.\n\n"
-        "Silakan pilih menu:",
+        "Selamat datang! Bot ini mencatat pemasukan dan pengeluaran Anda.\n\n"
+        "Pilih menu:",
         parse_mode='Markdown',
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler untuk tombol menu utama"""
+    """Handle main menu buttons"""
     query = update.callback_query
     await query.answer()
     
     if query.data == 'lapor':
-        # Menu lapor - pilih tipe transaksi
         keyboard = [
             [InlineKeyboardButton("💰 Pemasukan", callback_data='tipe_pemasukan')],
             [InlineKeyboardButton("💸 Pengeluaran", callback_data='tipe_pengeluaran')]
@@ -179,27 +159,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return NOMINAL
     
     elif query.data == 'cek':
-        # Menu cek laporan - kirim link spreadsheet
         try:
             spreadsheet = setup_google_sheets()
             sheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet.id}/edit"
             
             await query.edit_message_text(
                 f"📊 *Laporan Keuangan*\n\n"
-                f"Nama File: `{spreadsheet.title}`\n\n"
-                f"[Klik di sini untuk membuka spreadsheet]({sheet_url})\n\n"
-                f"Data tersimpan di worksheet: *{WORKSHEET_NAME}*",
+                f"📁 File: `{spreadsheet.title}`\n"
+                f"📄 Sheet: `{WORKSHEET_NAME}`\n\n"
+                f"[👉 Buka Spreadsheet]({sheet_url})",
                 parse_mode='Markdown',
                 disable_web_page_preview=True,
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🔙 Kembali ke Menu", callback_data='back')
+                    InlineKeyboardButton("🔙 Kembali", callback_data='back')
                 ]])
             )
         except Exception as e:
-            logger.error(f"Error accessing spreadsheet: {e}")
+            logger.error(f"Error in cek: {e}")
             await query.edit_message_text(
-                "❌ Terjadi kesalahan saat mengakses spreadsheet.\n"
-                "Pastikan spreadsheet sudah dibagikan ke service account.",
+                f"❌ Error accessing spreadsheet\n\n"
+                f"Pastikan spreadsheet sudah di-share ke service account.",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("🔙 Kembali", callback_data='back')
                 ]])
@@ -207,7 +186,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
 async def tipe_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler setelah memilih tipe (pemasukan/pengeluaran)"""
+    """Handle income/expense selection"""
     query = update.callback_query
     await query.answer()
     
@@ -218,72 +197,64 @@ async def tipe_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     emoji = "💰" if tipe == 'pemasukan' else "💸"
     
     await query.edit_message_text(
-        f"{emoji} Anda memilih *{tipe.upper()}*\n\n"
-        f"Silakan masukkan nominal angka (contoh: 50000 atau 100000):",
+        f"{emoji} *{tipe.upper()}*\n\n"
+        f"Masukkan nominal (contoh: 50000):",
         parse_mode='Markdown'
     )
     return NOMINAL
 
 async def get_nominal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler input nominal"""
+    """Handle nominal input"""
     user_id = update.effective_user.id
-    text = update.message.text
+    text = update.message.text.strip()
     
-    # Bersihkan input (hapus titik, koma, spasi)
-    clean_text = text.replace('.', '').replace(',', '').replace(' ', '')
+    # Clean input
+    clean = text.replace('.', '').replace(',', '').replace(' ', '').replace('Rp', '')
     
     try:
-        nominal = int(clean_text)
+        nominal = int(clean)
         if nominal <= 0:
-            raise ValueError("Nominal harus positif")
-        if nominal > 999999999:  # Batas maksimal 1 miliar
-            raise ValueError("Nominal terlalu besar")
+            raise ValueError("Nominal must be positive")
+        if nominal > 999999999999:
+            raise ValueError("Nominal too large")
             
         temp_data[user_id]['nominal'] = nominal
         
         await update.message.reply_text(
             "✅ Nominal tersimpan!\n\n"
-            "Sekarang kirim keterangan transaksi:\n"
-            "_contoh: Gaji bulan Januari, Makan siang, dll_",
-            parse_mode='Markdown'
+            "Kirim keterangan transaksi:"
         )
         return KETERANGAN
         
     except ValueError as e:
-        error_msg = str(e) if str(e) else "Format tidak valid"
         await update.message.reply_text(
-            f"❌ *Error:* {error_msg}\n\n"
-            f"Nominal harus berupa angka positif.\n"
-            f"Contoh: `50000`, `100.000`, `1.500.000`",
+            f"❌ *Error:* {str(e)}\n\n"
+            f"Masukkan angka valid (contoh: 50000):",
             parse_mode='Markdown'
         )
         return NOMINAL
 
 async def get_keterangan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler input keterangan"""
+    """Handle description input"""
     user_id = update.effective_user.id
     keterangan = update.message.text.strip()
     
     if len(keterangan) < 2:
-        await update.message.reply_text(
-            "❌ Keterangan terlalu pendek (minimal 2 karakter). Coba lagi:"
-        )
+        await update.message.reply_text("❌ Terlalu pendek (min 2 karakter). Coba lagi:")
         return KETERANGAN
     
-    if len(keterangan) > 100:
-        await update.message.reply_text(
-            "❌ Keterangan terlalu panjang (maksimal 100 karakter). Coba lagi:"
-        )
+    if len(keterangan) > 200:
+        await update.message.reply_text("❌ Terlalu panjang (max 200 karakter). Coba lagi:")
         return KETERANGAN
     
     temp_data[user_id]['keterangan'] = keterangan
     tipe = temp_data[user_id]['tipe']
     
-    # Jika pemasukan, langsung simpan tanpa kategori
+    # If income, save directly without category
     if tipe == 'pemasukan':
-        return await save_transaction(update, context, user_id, kategori="Pemasukan")
+        return await save_transaction(update, context, user_id, "Pemasukan")
     
-    # Jika pengeluaran, tampilkan pilihan kategori
+    # If expense, show category options
     keyboard = [
         [InlineKeyboardButton("🍽 Makan", callback_data='cat_Makan')],
         [InlineKeyboardButton("🚬 Rokok", callback_data='cat_Rokok')],
@@ -299,7 +270,7 @@ async def get_keterangan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return KATEGORI
 
 async def get_kategori(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler pilihan kategori"""
+    """Handle category selection"""
     query = update.callback_query
     await query.answer()
     
@@ -307,23 +278,18 @@ async def get_kategori(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kategori = query.data.replace('cat_', '')
     
     return await save_transaction(
-        update, context, user_id, kategori, 
+        update, context, user_id, kategori,
         edit_message=query.edit_message_text
     )
 
 async def save_transaction(update, context, user_id, kategori, edit_message=None):
-    """
-    Simpan transaksi ke Google Sheets.
-    Fungsi ini dipanggil setelah semua data lengkap.
-    """
+    """Save transaction to Google Sheets"""
     data = temp_data[user_id]
     
     try:
-        # Koneksi ke Google Sheets
         spreadsheet = setup_google_sheets()
         worksheet = get_or_create_worksheet(spreadsheet, WORKSHEET_NAME)
         
-        # Siapkan data untuk disimpan
         row = [
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             data['tipe'].capitalize(),
@@ -332,33 +298,31 @@ async def save_transaction(update, context, user_id, kategori, edit_message=None
             data['keterangan']
         ]
         
-        # Simpan ke worksheet
         worksheet.append_row(row)
-        logger.info(f"Transaction saved: {row}")
+        logger.info(f"✅ Saved transaction: {row}")
         
-        # Format pesan konfirmasi
-        tipe_icon = "💰" if data['tipe'] == 'pemasukan' else "💸"
+        # Format message
+        icon = "💰" if data['tipe'] == 'pemasukan' else "💸"
         nominal_fmt = f"Rp {data['nominal']:,}".replace(',', '.')
         
         message = (
-            f"✅ *Transaksi Berhasil Disimpan!*\n\n"
-            f"{tipe_icon} *Tipe:* {data['tipe'].capitalize()}\n"
+            f"✅ *Transaksi Tersimpan!*\n\n"
+            f"{icon} *Tipe:* {data['tipe'].capitalize()}\n"
             f"💵 *Nominal:* {nominal_fmt}\n"
             f"📁 *Kategori:* {kategori}\n"
             f"📝 *Keterangan:* {data['keterangan']}\n"
-            f"📅 *Waktu:* {datetime.now().strftime('%d-%m-%Y %H:%M')}\n\n"
-            f"Data tersimpan di spreadsheet: *{SPREADSHEET_NAME}*"
+            f"📅 *Waktu:* {datetime.now().strftime('%d-%m-%Y %H:%M')}"
         )
         
     except Exception as e:
-        logger.error(f"Error saving transaction: {e}")
-        message = (
-            f"❌ *Gagal menyimpan transaksi!*\n\n"
-            f"Error: `{str(e)}`\n\n"
-            f"Silakan coba lagi atau hubungi admin."
-        )
+        logger.error(f"❌ Error saving: {e}")
+        message = f"❌ *Gagal menyimpan!*\n\nError: `{str(e)[:100]}`"
     
-    # Tombol navigasi
+    # Cleanup
+    if user_id in temp_data:
+        del temp_data[user_id]
+    
+    # Navigation buttons
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📝 Lapor Lagi", callback_data='lapor'),
@@ -366,24 +330,19 @@ async def save_transaction(update, context, user_id, kategori, edit_message=None
         ]
     ])
     
-    # Kirim pesan (edit jika dari callback, reply jika dari message)
+    # Send message
     if edit_message:
         await edit_message(message, parse_mode='Markdown', reply_markup=keyboard)
     else:
         await update.message.reply_text(message, parse_mode='Markdown', reply_markup=keyboard)
     
-    # Bersihkan data temporary
-    if user_id in temp_data:
-        del temp_data[user_id]
-    
     return ConversationHandler.END
 
 async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler tombol kembali ke menu utama"""
+    """Back to main menu"""
     query = update.callback_query
     await query.answer()
     
-    # Bersihkan data jika ada yang tertinggal
     user_id = update.effective_user.id
     if user_id in temp_data:
         del temp_data[user_id]
@@ -394,21 +353,19 @@ async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     
     await query.edit_message_text(
-        "💰 *Bot Pencatatan Keuangan*\n\n"
-        "Selamat datang kembali!\n\n"
-        "Silakan pilih menu:",
+        "💰 *Bot Pencatatan Keuangan*\n\nPilih menu:",
         parse_mode='Markdown',
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler untuk membatalkan operasi"""
+    """Cancel operation"""
     user_id = update.effective_user.id
     if user_id in temp_data:
         del temp_data[user_id]
     
     await update.message.reply_text(
-        "❌ Operasi dibatalkan. Data tidak disimpan.",
+        "❌ Operasi dibatalkan.",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("🔙 Menu Utama", callback_data='back')
         ]])
@@ -416,57 +373,47 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler untuk error global"""
+    """Global error handler"""
     logger.error(f"Update {update} caused error {context.error}")
-    
     if update and update.effective_message:
         await update.effective_message.reply_text(
-            "⚠️ Terjadi kesalahan sistem. Silakan coba lagi atau ketik /start"
+            "⚠️ Terjadi kesalahan. Ketik /start untuk memulai ulang."
         )
 
 # ============================================
-# MAIN FUNCTION
+# MAIN
 # ============================================
 def main():
-    logger.info("=" * 50)
-    logger.info("Starting Bot Keuangan")
-    logger.info(f"Spreadsheet target: {SPREADSHEET_NAME}")
-    logger.info("=" * 50)
+    logger.info("=" * 60)
+    logger.info("🚀 BOT KEUANGAN STARTING")
+    logger.info(f"📁 Target: {SPREADSHEET_NAME}")
+    logger.info("=" * 60)
     
-    # Validasi environment variables
+    # Validate
     if not TELEGRAM_TOKEN:
-        logger.error("TELEGRAM_TOKEN not set!")
+        logger.error("❌ TELEGRAM_TOKEN not set!")
         return
     
-    # Test koneksi ke Google Sheets sebelum start bot
+    # Test Google Sheets connection
     try:
         spreadsheet = setup_google_sheets()
-        logger.info(f"✅ Successfully connected to spreadsheet: {spreadsheet.title}")
-        
-        # Test akses worksheet
         worksheet = get_or_create_worksheet(spreadsheet, WORKSHEET_NAME)
-        logger.info(f"✅ Worksheet ready: {worksheet.title}")
-        
+        logger.info(f"✅ Google Sheets OK: {spreadsheet.title} > {worksheet.title}")
     except Exception as e:
-        logger.error(f"❌ Failed to connect to Google Sheets: {e}")
-        logger.error("Please check:")
-        logger.error("1. GOOGLE_CREDENTIALS environment variable is set correctly")
-        logger.error(f"2. Spreadsheet '{SPREADSHEET_NAME}' exists and is shared to service account")
+        logger.error(f"❌ Google Sheets Error: {e}")
         return
     
-    # Start Flask server di thread terpisah (untuk keep-alive)
+    # Start Flask keep-alive server
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    logger.info("✅ Flask keep-alive server started")
+    logger.info(f"✅ Flask server started on port {PORT}")
     
-    # Setup Telegram bot
+    # Setup bot
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    # Conversation handler untuk flow laporan
+    # Conversation handler
     conv_handler = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(button_handler, pattern='^lapor$')
-        ],
+        entry_points=[CallbackQueryHandler(button_handler, pattern='^lapor$')],
         states={
             NOMINAL: [
                 CallbackQueryHandler(tipe_handler, pattern='^tipe_'),
@@ -479,10 +426,7 @@ def main():
                 CallbackQueryHandler(get_kategori, pattern='^cat_')
             ]
         },
-        fallbacks=[
-            CommandHandler('cancel', cancel),
-            CommandHandler('start', start)
-        ],
+        fallbacks=[CommandHandler('cancel', cancel)],
     )
     
     # Register handlers
@@ -492,14 +436,11 @@ def main():
     application.add_handler(CallbackQueryHandler(button_handler, pattern='^cek$'))
     application.add_error_handler(error_handler)
     
-    logger.info("✅ Bot is running and ready to receive messages!")
-    logger.info("=" * 50)
+    logger.info("✅ Bot is running!")
+    logger.info("=" * 60)
     
-    # Jalankan bot
-    application.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES
-    )
+    # Run bot
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
     main()
