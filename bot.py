@@ -55,146 +55,96 @@ def run_flask():
     app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
 
 # ============================================
-# GOOGLE SHEETS SETUP (DENGAN VALIDASI)
+# GOOGLE SHEETS SETUP (KHUSUS UNTUK RENDER)
 # ============================================
-def validate_credentials(creds_info):
-    """Validasi struktur credentials"""
-    required_fields = ['type', 'project_id', 'private_key', 'client_email']
-    
-    for field in required_fields:
-        if field not in creds_info:
-            raise ValueError(f"Missing required field: {field}")
-    
-    if creds_info.get('type') != 'service_account':
-        raise ValueError("Type must be 'service_account'")
-    
-    private_key = creds_info.get('private_key', '')
-    
-    # Cek private key format
-    if '-----BEGIN PRIVATE KEY-----' not in private_key:
-        raise ValueError("Private key missing BEGIN marker")
-    
-    if '-----END PRIVATE KEY-----' not in private_key:
-        raise ValueError("Private key missing END marker")
-    
-    # Cek panjang private key (harus ~2300+ karakter)
-    if len(private_key) < 1000:
-        raise ValueError(f"Private key too short ({len(private_key)} chars), likely corrupted")
-    
-    # Cek newlines
-    if '\n' not in private_key:
-        logger.warning("Private key may be missing newlines, attempting to fix...")
-        # Fix: tambahkan newlines jika tidak ada
-        private_key = private_key.replace('-----BEGIN PRIVATE KEY-----', '-----BEGIN PRIVATE KEY-----\n')
-        private_key = private_key.replace('-----END PRIVATE KEY-----', '\n-----END PRIVATE KEY-----\n')
-        creds_info['private_key'] = private_key
-    
-    return creds_info
-
-def load_credentials_from_env():
-    """Load credentials dari environment variable"""
-    creds_json = os.environ.get("GOOGLE_CREDENTIALS")
-    
-    if not creds_json:
-        return None
-    
-    try:
-        # Coba parse sebagai JSON
-        creds_info = json.loads(creds_json)
-        logger.info("✅ Credentials parsed from environment variable")
-        return validate_credentials(creds_info)
-    except json.JSONDecodeError as e:
-        logger.error(f"❌ Invalid JSON in GOOGLE_CREDENTIALS: {e}")
-        # Coba fix: mungkin ada escape issue
-        try:
-            # Coba parse dengan escaped newlines
-            fixed_json = creds_json.replace('\\n', '\n')
-            creds_info = json.loads(fixed_json)
-            logger.info("✅ Credentials parsed after fixing newlines")
-            return validate_credentials(creds_info)
-        except Exception as e2:
-            logger.error(f"❌ Still invalid after fix: {e2}")
-            raise
-
-def load_credentials_from_file():
-    """Load credentials dari file (termasuk Render Secret Files)"""
-    file_paths = [
-        '/etc/secrets/service_account',  # Render Secret File (prioritas)
-        '/etc/secrets/service_account.json',
-        'service_account.json',  # Local development
-        os.path.expanduser('~/service_account.json')
-    ]
-    
-    for path in file_paths:
-        if os.path.exists(path):
-            try:
-                with open(path, 'r') as f:
-                    creds_info = json.load(f)
-                logger.info(f"✅ Credentials loaded from: {path}")
-                return validate_credentials(creds_info)
-            except Exception as e:
-                logger.warning(f"⚠️ Failed to load from {path}: {e}")
-                continue
-    
-    return None
-
 def get_credentials():
-    """Get credentials dengan multiple fallback"""
+    """Get credentials dari Render Secret File"""
     scopes = [
         'https://www.googleapis.com/auth/spreadsheets',
         'https://www.googleapis.com/auth/drive'
     ]
     
-    # Coba dari file dulu (lebih reliable)
-    creds_info = load_credentials_from_file()
+    # Prioritas 1: Render Secret File
+    secret_paths = [
+        '/etc/secrets/google_credentials',  # Secret File di Render
+        '/etc/secrets/service_account',
+        '/etc/secrets/service_account.json',
+    ]
     
-    # Fallback ke environment variable
-    if not creds_info:
-        creds_info = load_credentials_from_env()
+    for path in secret_paths:
+        if os.path.exists(path):
+            try:
+                with open(path, 'r') as f:
+                    creds_info = json.load(f)
+                
+                # Validasi
+                if 'private_key' not in creds_info:
+                    logger.error(f"Missing private_key in {path}")
+                    continue
+                
+                private_key = creds_info['private_key']
+                
+                # Cek panjang private key
+                key_len = len(private_key)
+                logger.info(f"Private key length: {key_len}")
+                
+                if key_len < 1000:
+                    logger.error(f"Private key too short: {key_len} chars")
+                    continue
+                
+                # Fix newlines jika perlu
+                if '\\n' in private_key:
+                    private_key = private_key.replace('\\n', '\n')
+                    creds_info['private_key'] = private_key
+                    logger.info("Fixed escaped newlines in private key")
+                
+                credentials = Credentials.from_service_account_info(creds_info, scopes=scopes)
+                logger.info(f"✅ Credentials loaded from {path}")
+                logger.info(f"   Service Account: {creds_info.get('client_email')}")
+                return credentials
+                
+            except Exception as e:
+                logger.error(f"❌ Failed to load from {path}: {e}")
+                continue
     
-    if not creds_info:
-        raise ValueError(
-            "No valid credentials found! "
-            "Please set GOOGLE_CREDENTIALS env var or upload service_account.json file."
-        )
+    # Fallback: Environment variable (tidak direkomendasikan untuk production)
+    creds_json = os.environ.get("GOOGLE_CREDENTIALS")
+    if creds_json:
+        try:
+            creds_info = json.loads(creds_json)
+            credentials = Credentials.from_service_account_info(creds_info, scopes=scopes)
+            logger.info("✅ Credentials loaded from environment variable")
+            return credentials
+        except Exception as e:
+            logger.error(f"❌ Failed to load from env: {e}")
     
-    # Create credentials
-    try:
-        credentials = Credentials.from_service_account_info(creds_info, scopes=scopes)
-        logger.info(f"✅ Credentials created for: {creds_info.get('client_email')}")
-        return credentials
-    except Exception as e:
-        logger.error(f"❌ Failed to create credentials: {e}")
-        raise
+    raise ValueError("No valid credentials found in Secret Files or Environment!")
 
 def setup_google_sheets():
-    """Connect to Google Sheets dengan error handling yang detail"""
+    """Connect to Google Sheets"""
     try:
         credentials = get_credentials()
         client = gspread.authorize(credentials)
         
         try:
             spreadsheet = client.open(SPREADSHEET_NAME)
-            logger.info(f"✅ Connected to spreadsheet: {spreadsheet.title} (ID: {spreadsheet.id})")
+            logger.info(f"✅ Connected to: {spreadsheet.title}")
             return spreadsheet
         except gspread.SpreadsheetNotFound:
             logger.error(f"❌ Spreadsheet '{SPREADSHEET_NAME}' not found!")
-            logger.error("Pastikan:")
-            logger.error("1. Spreadsheet sudah dibuat dengan nama 'Catatan Keuangan'")
-            logger.error("2. Service account sudah di-share ke spreadsheet dengan permission EDITOR")
             raise
             
     except Exception as e:
-        logger.error(f"❌ Google Sheets setup failed: {e}")
+        logger.error(f"❌ Google Sheets error: {e}")
         raise
 
 def get_or_create_worksheet(spreadsheet, worksheet_name=WORKSHEET_NAME):
     """Get or create worksheet"""
     try:
         worksheet = spreadsheet.worksheet(worksheet_name)
-        logger.info(f"✅ Using worksheet: {worksheet_name}")
+        logger.info(f"✅ Worksheet: {worksheet_name}")
     except gspread.WorksheetNotFound:
-        logger.info(f"📝 Creating new worksheet: {worksheet_name}")
+        logger.info(f"📝 Creating: {worksheet_name}")
         worksheet = spreadsheet.add_worksheet(title=worksheet_name, rows=1000, cols=5)
         
         headers = ["Tanggal", "Tipe", "Nominal", "Kategori", "Keterangan"]
@@ -203,11 +153,10 @@ def get_or_create_worksheet(spreadsheet, worksheet_name=WORKSHEET_NAME):
         try:
             worksheet.format('A1:E1', {
                 'textFormat': {'bold': True},
-                'backgroundColor': {'red': 0.9, 'green': 0.9, 'blue': 0.9},
-                'horizontalAlignment': 'CENTER'
+                'backgroundColor': {'red': 0.9, 'green': 0.9, 'blue': 0.9}
             })
-        except Exception as e:
-            logger.warning(f"Could not format headers: {e}")
+        except:
+            pass
     
     return worksheet
 
@@ -215,22 +164,17 @@ def get_or_create_worksheet(spreadsheet, worksheet_name=WORKSHEET_NAME):
 # BOT HANDLERS
 # ============================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command"""
     keyboard = [
-        [InlineKeyboardButton("📝 Lapor Transaksi", callback_data='lapor')],
-        [InlineKeyboardButton("📊 Cek Laporan", callback_data='cek')]
+        [InlineKeyboardButton("📝 Lapor", callback_data='lapor')],
+        [InlineKeyboardButton("📊 Cek", callback_data='cek')]
     ]
-    
     await update.message.reply_text(
-        "💰 *Bot Pencatatan Keuangan*\n\n"
-        "Selamat datang! Bot ini mencatat pemasukan dan pengeluaran Anda.\n\n"
-        "Pilih menu:",
+        "💰 *Bot Keuangan*\n\nPilih menu:",
         parse_mode='Markdown',
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle main menu buttons"""
     query = update.callback_query
     await query.answer()
     
@@ -239,104 +183,67 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("💰 Pemasukan", callback_data='tipe_pemasukan')],
             [InlineKeyboardButton("💸 Pengeluaran", callback_data='tipe_pengeluaran')]
         ]
-        await query.edit_message_text(
-            "Pilih jenis transaksi:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+        await query.edit_message_text("Pilih:", reply_markup=InlineKeyboardMarkup(keyboard))
         return NOMINAL
     
     elif query.data == 'cek':
         try:
             spreadsheet = setup_google_sheets()
-            sheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet.id}/edit"
-            
+            url = f"https://docs.google.com/spreadsheets/d/{spreadsheet.id}/edit"
             await query.edit_message_text(
-                f"📊 *Laporan Keuangan*\n\n"
-                f"📁 File: `{spreadsheet.title}`\n"
-                f"📄 Sheet: `{WORKSHEET_NAME}`\n\n"
-                f"[👉 Buka Spreadsheet]({sheet_url})",
+                f"📊 [Buka Spreadsheet]({url})",
                 parse_mode='Markdown',
-                disable_web_page_preview=True,
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🔙 Kembali", callback_data='back')
-                ]])
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Kembali", callback_data='back')]])
             )
         except Exception as e:
-            logger.error(f"Error in cek: {e}")
-            error_msg = str(e)
-            if "invalid_grant" in error_msg:
-                error_msg = "Credentials tidak valid. Silakan perbarui service account key."
+            error_str = str(e)
+            if "invalid_grant" in error_str:
+                error_msg = "❌ Credentials tidak valid. Silakan perbarui di Render Secrets."
+            else:
+                error_msg = f"❌ Error: {error_str[:100]}"
             
             await query.edit_message_text(
-                f"❌ Error:\n\n`{error_msg}`",
-                parse_mode='Markdown',
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🔙 Kembali", callback_data='back')
-                ]])
+                error_msg,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Kembali", callback_data='back')]])
             )
         return ConversationHandler.END
 
 async def tipe_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle income/expense selection"""
     query = update.callback_query
     await query.answer()
-    
     user_id = update.effective_user.id
     tipe = query.data.replace('tipe_', '')
     temp_data[user_id] = {'tipe': tipe}
-    
     emoji = "💰" if tipe == 'pemasukan' else "💸"
-    
-    await query.edit_message_text(
-        f"{emoji} *{tipe.upper()}*\n\n"
-        f"Masukkan nominal (contoh: 50000):",
-        parse_mode='Markdown'
-    )
+    await query.edit_message_text(f"{emoji} *{tipe.upper()}*\n\nNominal:", parse_mode='Markdown')
     return NOMINAL
 
 async def get_nominal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle nominal input"""
     user_id = update.effective_user.id
-    text = update.message.text.strip()
-    
-    clean = text.replace('.', '').replace(',', '').replace(' ', '').replace('Rp', '')
+    text = update.message.text.strip().replace('.', '').replace(',', '').replace(' ', '').replace('Rp', '')
     
     try:
-        nominal = int(clean)
+        nominal = int(text)
         if nominal <= 0:
-            raise ValueError("Nominal harus positif")
-        if nominal > 999999999999:
-            raise ValueError("Nominal terlalu besar")
-            
+            raise ValueError()
         temp_data[user_id]['nominal'] = nominal
-        
-        await update.message.reply_text("✅ Nominal tersimpan!\n\nKirim keterangan:")
+        await update.message.reply_text("✅ Kirim keterangan:")
         return KETERANGAN
-        
-    except ValueError as e:
-        await update.message.reply_text(
-            f"❌ *Error:* {str(e)}\n\nMasukkan angka valid (contoh: 50000):",
-            parse_mode='Markdown'
-        )
+    except:
+        await update.message.reply_text("❌ Angka tidak valid. Coba lagi:")
         return NOMINAL
 
 async def get_keterangan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle description input"""
     user_id = update.effective_user.id
     keterangan = update.message.text.strip()
     
     if len(keterangan) < 2:
-        await update.message.reply_text("❌ Terlalu pendek (min 2 karakter). Coba lagi:")
-        return KETERANGAN
-    
-    if len(keterangan) > 200:
-        await update.message.reply_text("❌ Terlalu panjang (max 200 karakter). Coba lagi:")
+        await update.message.reply_text("❌ Terlalu pendek:")
         return KETERANGAN
     
     temp_data[user_id]['keterangan'] = keterangan
-    tipe = temp_data[user_id]['tipe']
     
-    if tipe == 'pemasukan':
+    if temp_data[user_id]['tipe'] == 'pemasukan':
         return await save_transaction(update, context, user_id, "Pemasukan")
     
     keyboard = [
@@ -346,33 +253,22 @@ async def get_keterangan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("☕ Nongkrong", callback_data='cat_Nongkrong')],
         [InlineKeyboardButton("📦 Lain-lain", callback_data='cat_Lain-lain')]
     ]
-    
-    await update.message.reply_text(
-        "Pilih kategori pengeluaran:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    await update.message.reply_text("Kategori:", reply_markup=InlineKeyboardMarkup(keyboard))
     return KATEGORI
 
 async def get_kategori(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle category selection"""
     query = update.callback_query
     await query.answer()
-    
     user_id = update.effective_user.id
     kategori = query.data.replace('cat_', '')
-    
-    return await save_transaction(
-        update, context, user_id, kategori,
-        edit_message=query.edit_message_text
-    )
+    return await save_transaction(update, context, user_id, kategori, query.edit_message_text)
 
-async def save_transaction(update, context, user_id, kategori, edit_message=None):
-    """Save transaction to Google Sheets"""
+async def save_transaction(update, context, user_id, kategori, edit_msg=None):
     data = temp_data[user_id]
     
     try:
         spreadsheet = setup_google_sheets()
-        worksheet = get_or_create_worksheet(spreadsheet, WORKSHEET_NAME)
+        worksheet = get_or_create_worksheet(spreadsheet)
         
         row = [
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -387,78 +283,54 @@ async def save_transaction(update, context, user_id, kategori, edit_message=None
         
         icon = "💰" if data['tipe'] == 'pemasukan' else "💸"
         nominal_fmt = f"Rp {data['nominal']:,}".replace(',', '.')
-        
-        message = (
-            f"✅ *Transaksi Tersimpan!*\n\n"
-            f"{icon} *Tipe:* {data['tipe'].capitalize()}\n"
-            f"💵 *Nominal:* {nominal_fmt}\n"
-            f"📁 *Kategori:* {kategori}\n"
-            f"📝 *Keterangan:* {data['keterangan']}\n"
-            f"📅 *Waktu:* {datetime.now().strftime('%d-%m-%Y %H:%M')}"
-        )
+        msg = f"✅ *Tersimpan!*\n\n{icon} {data['tipe'].capitalize()}\n💵 {nominal_fmt}\n📁 {kategori}\n📝 {data['keterangan']}"
         
     except Exception as e:
-        logger.error(f"❌ Error saving: {e}")
-        message = f"❌ *Gagal menyimpan!*\n\nError: `{str(e)[:100]}`"
+        logger.error(f"❌ Save error: {e}")
+        error_str = str(e)
+        if "invalid_grant" in error_str:
+            msg = "❌ *Gagal!*\n\nCredentials Google tidak valid. Hubungi admin untuk perbarui."
+        else:
+            msg = f"❌ *Gagal!*\n\n{error_str[:100]}"
     
     if user_id in temp_data:
         del temp_data[user_id]
     
     keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📝 Lapor Lagi", callback_data='lapor'),
-            InlineKeyboardButton("🔙 Menu Utama", callback_data='back')
-        ]
+        [InlineKeyboardButton("📝 Lagi", callback_data='lapor'),
+         InlineKeyboardButton("🔙 Menu", callback_data='back')]
     ])
     
-    if edit_message:
-        await edit_message(message, parse_mode='Markdown', reply_markup=keyboard)
+    if edit_msg:
+        await edit_msg(msg, parse_mode='Markdown', reply_markup=keyboard)
     else:
-        await update.message.reply_text(message, parse_mode='Markdown', reply_markup=keyboard)
+        await update.message.reply_text(msg, parse_mode='Markdown', reply_markup=keyboard)
     
     return ConversationHandler.END
 
 async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Back to main menu"""
     query = update.callback_query
     await query.answer()
-    
     user_id = update.effective_user.id
     if user_id in temp_data:
         del temp_data[user_id]
-    
-    keyboard = [
-        [InlineKeyboardButton("📝 Lapor Transaksi", callback_data='lapor')],
-        [InlineKeyboardButton("📊 Cek Laporan", callback_data='cek')]
-    ]
-    
-    await query.edit_message_text(
-        "💰 *Bot Pencatatan Keuangan*\n\nPilih menu:",
-        parse_mode='Markdown',
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    keyboard = [[InlineKeyboardButton("📝 Lapor", callback_data='lapor')], 
+                [InlineKeyboardButton("📊 Cek", callback_data='cek')]]
+    await query.edit_message_text("💰 *Bot Keuangan*\n\nPilih menu:", parse_mode='Markdown', 
+                                  reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel operation"""
     user_id = update.effective_user.id
     if user_id in temp_data:
         del temp_data[user_id]
-    
-    await update.message.reply_text(
-        "❌ Operasi dibatalkan.",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🔙 Menu Utama", callback_data='back')
-        ]])
-    )
+    await update.message.reply_text("❌ Dibatalkan.", 
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data='back')]]))
     return ConversationHandler.END
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Global error handler"""
     logger.error(f"Update {update} caused error {context.error}")
     if update and update.effective_message:
-        await update.effective_message.reply_text(
-            "⚠️ Terjadi kesalahan. Ketik /start untuk memulai ulang."
-        )
+        await update.effective_message.reply_text("⚠️ Error. Ketik /start untuk ulang.")
 
 # ============================================
 # MAIN
@@ -466,28 +338,26 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     logger.info("=" * 60)
     logger.info("🚀 BOT KEUANGAN STARTING")
-    logger.info(f"📁 Target: {SPREADSHEET_NAME}")
     logger.info("=" * 60)
     
     if not TELEGRAM_TOKEN:
         logger.error("❌ TELEGRAM_TOKEN not set!")
         return
     
-    # Test Google Sheets dengan detail
+    # Test Google Sheets
     try:
-        logger.info("🔍 Testing Google Sheets connection...")
+        logger.info("🔍 Testing Google Sheets...")
         spreadsheet = setup_google_sheets()
-        worksheet = get_or_create_worksheet(spreadsheet, WORKSHEET_NAME)
-        logger.info(f"✅ Google Sheets OK: {spreadsheet.title} > {worksheet.title}")
+        worksheet = get_or_create_worksheet(spreadsheet)
+        logger.info(f"✅ Google Sheets OK: {spreadsheet.title}")
     except Exception as e:
         logger.error(f"❌ Google Sheets Error: {e}")
-        # Tetap lanjutkan agar bot bisa jalan walau spreadsheet error
-        # User bisa diinfo via pesan error saat coba akses fitur
+        # Tetap lanjutkan agar bot bisa jalan
     
     # Start Flask
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    logger.info(f"✅ Flask server started on port {PORT}")
+    logger.info(f"✅ Flask started on port {PORT}")
     
     # Setup bot
     application = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -495,16 +365,10 @@ def main():
     conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(button_handler, pattern='^lapor$')],
         states={
-            NOMINAL: [
-                CallbackQueryHandler(tipe_handler, pattern='^tipe_'),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, get_nominal)
-            ],
-            KETERANGAN: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, get_keterangan)
-            ],
-            KATEGORI: [
-                CallbackQueryHandler(get_kategori, pattern='^cat_')
-            ]
+            NOMINAL: [CallbackQueryHandler(tipe_handler, pattern='^tipe_'),
+                     MessageHandler(filters.TEXT & ~filters.COMMAND, get_nominal)],
+            KETERANGAN: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_keterangan)],
+            KATEGORI: [CallbackQueryHandler(get_kategori, pattern='^cat_')]
         },
         fallbacks=[CommandHandler('cancel', cancel)],
     )
@@ -515,7 +379,7 @@ def main():
     application.add_handler(CallbackQueryHandler(button_handler, pattern='^cek$'))
     application.add_error_handler(error_handler)
     
-    logger.info("✅ Bot is running!")
+    logger.info("✅ Bot running!")
     logger.info("=" * 60)
     
     application.run_polling(drop_pending_updates=True)
