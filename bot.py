@@ -82,6 +82,35 @@ def load_credentials_from_file():
     
     return None
 
+def get_credentials():
+    """Get credentials dengan multiple fallback"""
+    scopes = [
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/drive'
+    ]
+    
+    # Coba dari file dulu (lebih reliable)
+    creds_info = load_credentials_from_file()
+    
+    # Fallback ke environment variable
+    if not creds_info:
+        creds_info = load_credentials_from_env()
+    
+    if not creds_info:
+        raise ValueError(
+            "No valid credentials found! "
+            "Please set GOOGLE_CREDENTIALS env var or upload service_account.json file."
+        )
+    
+    # Create credentials
+    try:
+        credentials = Credentials.from_service_account_info(creds_info, scopes=scopes)
+        logger.info(f"✅ Credentials created for: {creds_info.get('client_email')}")
+        return credentials
+    except Exception as e:
+        logger.error(f"❌ Failed to create credentials: {e}")
+        raise
+
 def setup_google_sheets():
     """Connect to Google Sheets"""
     try:
