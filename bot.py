@@ -60,31 +60,27 @@ def run_flask():
 # ============================================
 # GOOGLE SHEETS SETUP
 # ============================================
-def get_credentials():
-    """Get credentials from file or environment"""
-    scopes = [
-        'https://www.googleapis.com/auth/spreadsheets',
-        'https://www.googleapis.com/auth/drive'
+def load_credentials_from_file():
+    """Load credentials dari file (termasuk Render Secret Files)"""
+    file_paths = [
+        '/etc/secrets/service_account',  # Render Secret File (prioritas)
+        '/etc/secrets/service_account.json',
+        'service_account.json',  # Local development
+        os.path.expanduser('~/service_account.json')
     ]
     
-    # Coba baca dari file dulu (untuk Render, upload via Secret Files)
-    if os.path.exists('service_account.json'):
-        credentials = Credentials.from_service_account_file(
-            'service_account.json',
-            scopes=scopes
-        )
-        logger.info("✅ Credentials loaded from file")
-        return credentials
+    for path in file_paths:
+        if os.path.exists(path):
+            try:
+                with open(path, 'r') as f:
+                    creds_info = json.load(f)
+                logger.info(f"✅ Credentials loaded from: {path}")
+                return validate_credentials(creds_info)
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to load from {path}: {e}")
+                continue
     
-    # Fallback ke environment variable
-    creds_json = os.environ.get("GOOGLE_CREDENTIALS")
-    if creds_json:
-        creds_info = json.loads(creds_json)
-        credentials = Credentials.from_service_account_info(creds_info, scopes=scopes)
-        logger.info("✅ Credentials loaded from env")
-        return credentials
-    
-    raise ValueError("No credentials found!")
+    return None
 
 def setup_google_sheets():
     """Connect to Google Sheets"""
