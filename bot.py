@@ -1,6 +1,7 @@
 import os
 import logging
 import json
+import sys
 from datetime import datetime
 from threading import Thread
 
@@ -17,10 +18,6 @@ from telegram.ext import (
     filters
 )
 from flask import Flask
-
-# Load environment variables
-from dotenv import load_dotenv
-load_dotenv()
 
 # ============================================
 # KONFIGURASI
@@ -58,8 +55,67 @@ def run_flask():
     app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
 
 # ============================================
-# GOOGLE SHEETS SETUP
+# GOOGLE SHEETS SETUP (DENGAN VALIDASI)
 # ============================================
+def validate_credentials(creds_info):
+    """Validasi struktur credentials"""
+    required_fields = ['type', 'project_id', 'private_key', 'client_email']
+    
+    for field in required_fields:
+        if field not in creds_info:
+            raise ValueError(f"Missing required field: {field}")
+    
+    if creds_info.get('type') != 'service_account':
+        raise ValueError("Type must be 'service_account'")
+    
+    private_key = creds_info.get('private_key', '')
+    
+    # Cek private key format
+    if '-----BEGIN PRIVATE KEY-----' not in private_key:
+        raise ValueError("Private key missing BEGIN marker")
+    
+    if '-----END PRIVATE KEY-----' not in private_key:
+        raise ValueError("Private key missing END marker")
+    
+    # Cek panjang private key (harus ~2300+ karakter)
+    if len(private_key) < 1000:
+        raise ValueError(f"Private key too short ({len(private_key)} chars), likely corrupted")
+    
+    # Cek newlines
+    if '\n' not in private_key:
+        logger.warning("Private key may be missing newlines, attempting to fix...")
+        # Fix: tambahkan newlines jika tidak ada
+        private_key = private_key.replace('-----BEGIN PRIVATE KEY-----', '-----BEGIN PRIVATE KEY-----\n')
+        private_key = private_key.replace('-----END PRIVATE KEY-----', '\n-----END PRIVATE KEY-----\n')
+        creds_info['private_key'] = private_key
+    
+    return creds_info
+
+def load_credentials_from_env():
+    """Load credentials dari environment variable"""
+    creds_json = os.environ.get("GOOGLE_CREDENTIALS")
+    
+    if not creds_json:
+        return None
+    
+    try:
+        # Coba parse sebagai JSON
+        creds_info = json.loads(creds_json)
+        logger.info("✅ Credentials parsed from environment variable")
+        return validate_credentials(creds_info)
+    except json.JSONDecodeError as e:
+        logger.error(f"❌ Invalid JSON in GOOGLE_CREDENTIALS: {e}")
+        # Coba fix: mungkin ada escape issue
+        try:
+            # Coba parse dengan escaped newlines
+            fixed_json = creds_json.replace('\\n', '\n')
+            creds_info = json.loads(fixed_json)
+            logger.info("✅ Credentials parsed after fixing newlines")
+            return validate_credentials(creds_info)
+        except Exception as e2:
+            logger.error(f"❌ Still invalid after fix: {e2}")
+            raise
+
 def load_credentials_from_file():
     """Load credentials dari file (termasuk Render Secret Files)"""
     file_paths = [
@@ -112,22 +168,24 @@ def get_credentials():
         raise
 
 def setup_google_sheets():
-    """Connect to Google Sheets"""
+    """Connect to Google Sheets dengan error handling yang detail"""
     try:
         credentials = get_credentials()
         client = gspread.authorize(credentials)
         
         try:
             spreadsheet = client.open(SPREADSHEET_NAME)
-            logger.info(f"✅ Connected to spreadsheet: {spreadsheet.title}")
+            logger.info(f"✅ Connected to spreadsheet: {spreadsheet.title} (ID: {spreadsheet.id})")
             return spreadsheet
         except gspread.SpreadsheetNotFound:
             logger.error(f"❌ Spreadsheet '{SPREADSHEET_NAME}' not found!")
-            logger.error("Make sure the spreadsheet exists and is shared with the service account")
+            logger.error("Pastikan:")
+            logger.error("1. Spreadsheet sudah dibuat dengan nama 'Catatan Keuangan'")
+            logger.error("2. Service account sudah di-share ke spreadsheet dengan permission EDITOR")
             raise
             
     except Exception as e:
-        logger.error(f"❌ Failed to setup Google Sheets: {e}")
+        logger.error(f"❌ Google Sheets setup failed: {e}")
         raise
 
 def get_or_create_worksheet(spreadsheet, worksheet_name=WORKSHEET_NAME):
@@ -139,11 +197,9 @@ def get_or_create_worksheet(spreadsheet, worksheet_name=WORKSHEET_NAME):
         logger.info(f"📝 Creating new worksheet: {worksheet_name}")
         worksheet = spreadsheet.add_worksheet(title=worksheet_name, rows=1000, cols=5)
         
-        # Add headers
         headers = ["Tanggal", "Tipe", "Nominal", "Kategori", "Keterangan"]
         worksheet.append_row(headers)
         
-        # Format headers
         try:
             worksheet.format('A1:E1', {
                 'textFormat': {'bold': True},
@@ -207,9 +263,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e:
             logger.error(f"Error in cek: {e}")
+            error_msg = str(e)
+            if "invalid_grant" in error_msg:
+                error_msg = "Credentials tidak valid. Silakan perbarui service account key."
+            
             await query.edit_message_text(
-                f"❌ Error accessing spreadsheet\n\n"
-                f"Pastikan spreadsheet sudah di-share ke service account.",
+                f"❌ Error:\n\n`{error_msg}`",
+                parse_mode='Markdown',
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("🔙 Kembali", callback_data='back')
                 ]])
@@ -239,28 +299,23 @@ async def get_nominal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text.strip()
     
-    # Clean input
     clean = text.replace('.', '').replace(',', '').replace(' ', '').replace('Rp', '')
     
     try:
         nominal = int(clean)
         if nominal <= 0:
-            raise ValueError("Nominal must be positive")
+            raise ValueError("Nominal harus positif")
         if nominal > 999999999999:
-            raise ValueError("Nominal too large")
+            raise ValueError("Nominal terlalu besar")
             
         temp_data[user_id]['nominal'] = nominal
         
-        await update.message.reply_text(
-            "✅ Nominal tersimpan!\n\n"
-            "Kirim keterangan transaksi:"
-        )
+        await update.message.reply_text("✅ Nominal tersimpan!\n\nKirim keterangan:")
         return KETERANGAN
         
     except ValueError as e:
         await update.message.reply_text(
-            f"❌ *Error:* {str(e)}\n\n"
-            f"Masukkan angka valid (contoh: 50000):",
+            f"❌ *Error:* {str(e)}\n\nMasukkan angka valid (contoh: 50000):",
             parse_mode='Markdown'
         )
         return NOMINAL
@@ -281,11 +336,9 @@ async def get_keterangan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     temp_data[user_id]['keterangan'] = keterangan
     tipe = temp_data[user_id]['tipe']
     
-    # If income, save directly without category
     if tipe == 'pemasukan':
         return await save_transaction(update, context, user_id, "Pemasukan")
     
-    # If expense, show category options
     keyboard = [
         [InlineKeyboardButton("🍽 Makan", callback_data='cat_Makan')],
         [InlineKeyboardButton("🚬 Rokok", callback_data='cat_Rokok')],
@@ -330,9 +383,8 @@ async def save_transaction(update, context, user_id, kategori, edit_message=None
         ]
         
         worksheet.append_row(row)
-        logger.info(f"✅ Saved transaction: {row}")
+        logger.info(f"✅ Saved: {row}")
         
-        # Format message
         icon = "💰" if data['tipe'] == 'pemasukan' else "💸"
         nominal_fmt = f"Rp {data['nominal']:,}".replace(',', '.')
         
@@ -349,11 +401,9 @@ async def save_transaction(update, context, user_id, kategori, edit_message=None
         logger.error(f"❌ Error saving: {e}")
         message = f"❌ *Gagal menyimpan!*\n\nError: `{str(e)[:100]}`"
     
-    # Cleanup
     if user_id in temp_data:
         del temp_data[user_id]
     
-    # Navigation buttons
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📝 Lapor Lagi", callback_data='lapor'),
@@ -361,7 +411,6 @@ async def save_transaction(update, context, user_id, kategori, edit_message=None
         ]
     ])
     
-    # Send message
     if edit_message:
         await edit_message(message, parse_mode='Markdown', reply_markup=keyboard)
     else:
@@ -420,21 +469,22 @@ def main():
     logger.info(f"📁 Target: {SPREADSHEET_NAME}")
     logger.info("=" * 60)
     
-    # Validate
     if not TELEGRAM_TOKEN:
         logger.error("❌ TELEGRAM_TOKEN not set!")
         return
     
-    # Test Google Sheets connection
+    # Test Google Sheets dengan detail
     try:
+        logger.info("🔍 Testing Google Sheets connection...")
         spreadsheet = setup_google_sheets()
         worksheet = get_or_create_worksheet(spreadsheet, WORKSHEET_NAME)
         logger.info(f"✅ Google Sheets OK: {spreadsheet.title} > {worksheet.title}")
     except Exception as e:
         logger.error(f"❌ Google Sheets Error: {e}")
-        return
+        # Tetap lanjutkan agar bot bisa jalan walau spreadsheet error
+        # User bisa diinfo via pesan error saat coba akses fitur
     
-    # Start Flask keep-alive server
+    # Start Flask
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
     logger.info(f"✅ Flask server started on port {PORT}")
@@ -442,7 +492,6 @@ def main():
     # Setup bot
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    # Conversation handler
     conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(button_handler, pattern='^lapor$')],
         states={
@@ -460,7 +509,6 @@ def main():
         fallbacks=[CommandHandler('cancel', cancel)],
     )
     
-    # Register handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(conv_handler)
     application.add_handler(CallbackQueryHandler(back_to_menu, pattern='^back$'))
@@ -470,7 +518,6 @@ def main():
     logger.info("✅ Bot is running!")
     logger.info("=" * 60)
     
-    # Run bot
     application.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
