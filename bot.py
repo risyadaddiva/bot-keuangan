@@ -187,6 +187,7 @@ def get_or_create_worksheet(spreadsheet, worksheet_name=WORKSHEET_NAME):
 # BOT HANDLERS
 # ============================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop('last_saved_msg', None)
     keyboard = [
         [InlineKeyboardButton("📝 Lapor", callback_data='lapor')],
         [InlineKeyboardButton("📊 Cek", callback_data='cek')]
@@ -369,6 +370,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id in temp_data:
         del temp_data[user_id]
+    context.user_data.pop('last_saved_msg', None)
     await update.message.reply_text("❌ Dibatalkan.", 
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data='back')]]))
     return ConversationHandler.END
