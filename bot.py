@@ -2,6 +2,8 @@ import os
 import logging
 import json
 import sys
+import time
+import urllib.request
 from datetime import datetime
 from threading import Thread
 
@@ -53,6 +55,27 @@ def health():
 
 def run_flask():
     app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
+
+# ============================================
+# SELF-PING KEEP-ALIVE (RENDER FREE TIER)
+# ============================================
+KEEP_ALIVE_URL = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("KEEP_ALIVE_URL")
+KEEP_ALIVE_INTERVAL = int(os.environ.get("KEEP_ALIVE_INTERVAL", 300))
+
+def keep_alive():
+    """Ping own health endpoint to prevent Render free tier from sleeping."""
+    if not KEEP_ALIVE_URL:
+        logger.warning("⚠️ RENDER_EXTERNAL_URL not set. Self-ping disabled.")
+        return
+    url = KEEP_ALIVE_URL.rstrip('/') + '/health'
+    logger.info(f"🏓 Keep-alive pinging {url} every {KEEP_ALIVE_INTERVAL}s")
+    while True:
+        try:
+            time.sleep(KEEP_ALIVE_INTERVAL)
+            req = urllib.request.urlopen(url, timeout=10)
+            logger.info(f"🏓 Ping OK: {req.status}")
+        except Exception as e:
+            logger.warning(f"🏓 Ping failed: {e}")
 
 # ============================================
 # GOOGLE SHEETS SETUP (KHUSUS UNTUK RENDER)
@@ -164,6 +187,7 @@ def get_or_create_worksheet(spreadsheet, worksheet_name=WORKSHEET_NAME):
 # BOT HANDLERS
 # ============================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop('last_saved_msg', None)
     keyboard = [
         [InlineKeyboardButton("📝 Lapor", callback_data='lapor')],
         [InlineKeyboardButton("📊 Cek", callback_data='cek')]
@@ -183,7 +207,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("💰 Pemasukan", callback_data='tipe_pemasukan')],
             [InlineKeyboardButton("💸 Pengeluaran", callback_data='tipe_pengeluaran')]
         ]
-        await query.edit_message_text("Pilih:", reply_markup=InlineKeyboardMarkup(keyboard))
+        saved_msg = context.user_data.get('last_saved_msg')
+        if saved_msg:
+            try:
+                await query.edit_message_text(saved_msg, parse_mode='Markdown')
+            except Exception:
+                pass
+            context.user_data.pop('last_saved_msg', None)
+            await query.message.reply_text("Pilih:", reply_markup=InlineKeyboardMarkup(keyboard))
+        else:
+            await query.edit_message_text("Pilih:", reply_markup=InlineKeyboardMarkup(keyboard))
         return NOMINAL
     
     elif query.data == 'cek':
@@ -250,8 +283,9 @@ async def get_keterangan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🍽 Makan", callback_data='cat_Makan')],
         [InlineKeyboardButton("🚬 Rokok", callback_data='cat_Rokok')],
         [InlineKeyboardButton("⛽ Bensin", callback_data='cat_Bensin')],
-        [InlineKeyboardButton("☕ Nongkrong", callback_data='cat_Nongkrong')],
-        [InlineKeyboardButton("📦 Lain-lain", callback_data='cat_Lain-lain')]
+        [InlineKeyboardButton("☕ Nongkrong/ Jajan", callback_data='cat_Nongkrong/ Jajan')],
+        [InlineKeyboardButton("📦 Lain-lain", callback_data='cat_Lain-lain')],
+        [InlineKeyboardButton("🏠 Living Cost", callback_data='cat_Living Cost')]
     ]
     await update.message.reply_text("Kategori:", reply_markup=InlineKeyboardMarkup(keyboard))
     return KATEGORI
@@ -306,6 +340,8 @@ async def save_transaction(update, context, user_id, kategori, edit_msg=None):
     else:
         await update.message.reply_text(msg, parse_mode='Markdown', reply_markup=keyboard)
     
+    context.user_data['last_saved_msg'] = msg
+    
     return ConversationHandler.END
 
 async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -316,13 +352,25 @@ async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         del temp_data[user_id]
     keyboard = [[InlineKeyboardButton("📝 Lapor", callback_data='lapor')], 
                 [InlineKeyboardButton("📊 Cek", callback_data='cek')]]
-    await query.edit_message_text("💰 *Bot Keuangan*\n\nPilih menu:", parse_mode='Markdown', 
-                                  reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    saved_msg = context.user_data.get('last_saved_msg')
+    if saved_msg:
+        try:
+            await query.edit_message_text(saved_msg, parse_mode='Markdown')
+        except Exception:
+            pass
+        context.user_data.pop('last_saved_msg', None)
+        await query.message.reply_text("💰 *Bot Keuangan*\n\nPilih menu:", parse_mode='Markdown',
+                                       reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await query.edit_message_text("💰 *Bot Keuangan*\n\nPilih menu:", parse_mode='Markdown', 
+                                      reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id in temp_data:
         del temp_data[user_id]
+    context.user_data.pop('last_saved_msg', None)
     await update.message.reply_text("❌ Dibatalkan.", 
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data='back')]]))
     return ConversationHandler.END
@@ -358,6 +406,10 @@ def main():
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
     logger.info(f"✅ Flask started on port {PORT}")
+    
+    # Start self-ping keep-alive
+    ping_thread = Thread(target=keep_alive, daemon=True)
+    ping_thread.start()
     
     # Setup bot
     application = Application.builder().token(TELEGRAM_TOKEN).build()
