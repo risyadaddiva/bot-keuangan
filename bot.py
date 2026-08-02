@@ -1,7 +1,7 @@
 import os
 import logging
 import json
-import sys
+import asyncio
 import time
 import urllib.request
 from datetime import datetime
@@ -19,7 +19,7 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
-from flask import Flask
+from flask import Flask, request, Response
 
 # ============================================
 # KONFIGURASI
@@ -28,6 +28,8 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 SPREADSHEET_NAME = "Catatan Keuangan"
 WORKSHEET_NAME = "Transaksi"
 PORT = int(os.environ.get("PORT", 10000))
+WEBHOOK_BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip('/')
+KEEP_ALIVE_INTERVAL = int(os.environ.get("KEEP_ALIVE_INTERVAL", 300))
 
 # Setup logging
 logging.basicConfig(
@@ -41,33 +43,58 @@ NOMINAL, KETERANGAN, KATEGORI = range(3)
 temp_data = {}
 
 # ============================================
-# FLASK KEEP-ALIVE SERVER
+# ASYNCIO EVENT LOOP (dedicated background loop)
 # ============================================
-app = Flask(__name__)
+bot_loop = asyncio.new_event_loop()
+ptb_app = None  # will be set after setup
 
-@app.route('/')
+def run_bot_loop():
+    """Run the dedicated asyncio event loop in a background thread."""
+    asyncio.set_event_loop(bot_loop)
+    bot_loop.run_forever()
+
+# ============================================
+# FLASK WEB SERVER
+# ============================================
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
 def home():
     return "🤖 Bot Keuangan Aktif!"
 
-@app.route('/health')
+@flask_app.route('/health')
 def health():
     return {"status": "ok", "timestamp": datetime.now().isoformat()}
 
-def run_flask():
-    app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
+@flask_app.route(f'/webhook', methods=['POST'])
+def webhook():
+    """Receive webhook updates from Telegram and forward to PTB."""
+    if ptb_app is None:
+        logger.warning("⚠️ ptb_app not ready yet.")
+        return Response(status=503)
+
+    try:
+        data = request.get_json(force=True)
+        update = Update.de_json(data, ptb_app.bot)
+        future = asyncio.run_coroutine_threadsafe(
+            ptb_app.process_update(update),
+            bot_loop
+        )
+        future.result(timeout=30)
+    except Exception as e:
+        logger.error(f"❌ Webhook processing error: {e}")
+
+    return Response(status=200)
 
 # ============================================
 # SELF-PING KEEP-ALIVE (RENDER FREE TIER)
 # ============================================
-KEEP_ALIVE_URL = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("KEEP_ALIVE_URL")
-KEEP_ALIVE_INTERVAL = int(os.environ.get("KEEP_ALIVE_INTERVAL", 300))
-
 def keep_alive():
     """Ping own health endpoint to prevent Render free tier from sleeping."""
-    if not KEEP_ALIVE_URL:
+    if not WEBHOOK_BASE_URL:
         logger.warning("⚠️ RENDER_EXTERNAL_URL not set. Self-ping disabled.")
         return
-    url = KEEP_ALIVE_URL.rstrip('/') + '/health'
+    url = WEBHOOK_BASE_URL + '/health'
     logger.info(f"🏓 Keep-alive pinging {url} every {KEEP_ALIVE_INTERVAL}s")
     while True:
         try:
@@ -78,59 +105,55 @@ def keep_alive():
             logger.warning(f"🏓 Ping failed: {e}")
 
 # ============================================
-# GOOGLE SHEETS SETUP (KHUSUS UNTUK RENDER)
+# GOOGLE SHEETS SETUP
 # ============================================
 def get_credentials():
-    """Get credentials dari Render Secret File"""
+    """Get credentials dari Render Secret File atau Environment Variable."""
     scopes = [
         'https://www.googleapis.com/auth/spreadsheets',
         'https://www.googleapis.com/auth/drive'
     ]
-    
+
     # Prioritas 1: Render Secret File
     secret_paths = [
-        '/etc/secrets/google_credentials',  # Secret File di Render
+        '/etc/secrets/google_credentials',
         '/etc/secrets/service_account',
         '/etc/secrets/service_account.json',
     ]
-    
+
     for path in secret_paths:
         if os.path.exists(path):
             try:
                 with open(path, 'r') as f:
                     creds_info = json.load(f)
-                
-                # Validasi
+
                 if 'private_key' not in creds_info:
                     logger.error(f"Missing private_key in {path}")
                     continue
-                
+
                 private_key = creds_info['private_key']
-                
-                # Cek panjang private key
                 key_len = len(private_key)
                 logger.info(f"Private key length: {key_len}")
-                
+
                 if key_len < 1000:
                     logger.error(f"Private key too short: {key_len} chars")
                     continue
-                
-                # Fix newlines jika perlu
+
                 if '\\n' in private_key:
                     private_key = private_key.replace('\\n', '\n')
                     creds_info['private_key'] = private_key
                     logger.info("Fixed escaped newlines in private key")
-                
+
                 credentials = Credentials.from_service_account_info(creds_info, scopes=scopes)
                 logger.info(f"✅ Credentials loaded from {path}")
                 logger.info(f"   Service Account: {creds_info.get('client_email')}")
                 return credentials
-                
+
             except Exception as e:
                 logger.error(f"❌ Failed to load from {path}: {e}")
                 continue
-    
-    # Fallback: Environment variable (tidak direkomendasikan untuk production)
+
+    # Fallback: Environment Variable
     creds_json = os.environ.get("GOOGLE_CREDENTIALS")
     if creds_json:
         try:
@@ -140,15 +163,15 @@ def get_credentials():
             return credentials
         except Exception as e:
             logger.error(f"❌ Failed to load from env: {e}")
-    
+
     raise ValueError("No valid credentials found in Secret Files or Environment!")
 
 def setup_google_sheets():
-    """Connect to Google Sheets"""
+    """Connect to Google Sheets."""
     try:
         credentials = get_credentials()
         client = gspread.authorize(credentials)
-        
+
         try:
             spreadsheet = client.open(SPREADSHEET_NAME)
             logger.info(f"✅ Connected to: {spreadsheet.title}")
@@ -156,31 +179,31 @@ def setup_google_sheets():
         except gspread.SpreadsheetNotFound:
             logger.error(f"❌ Spreadsheet '{SPREADSHEET_NAME}' not found!")
             raise
-            
+
     except Exception as e:
         logger.error(f"❌ Google Sheets error: {e}")
         raise
 
 def get_or_create_worksheet(spreadsheet, worksheet_name=WORKSHEET_NAME):
-    """Get or create worksheet"""
+    """Get or create worksheet."""
     try:
         worksheet = spreadsheet.worksheet(worksheet_name)
         logger.info(f"✅ Worksheet: {worksheet_name}")
     except gspread.WorksheetNotFound:
         logger.info(f"📝 Creating: {worksheet_name}")
         worksheet = spreadsheet.add_worksheet(title=worksheet_name, rows=1000, cols=5)
-        
+
         headers = ["Tanggal", "Tipe", "Nominal", "Kategori", "Keterangan"]
         worksheet.append_row(headers)
-        
+
         try:
             worksheet.format('A1:E1', {
                 'textFormat': {'bold': True},
                 'backgroundColor': {'red': 0.9, 'green': 0.9, 'blue': 0.9}
             })
-        except:
+        except Exception:
             pass
-    
+
     return worksheet
 
 # ============================================
@@ -201,7 +224,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
+
     if query.data == 'lapor':
         keyboard = [
             [InlineKeyboardButton("💰 Pemasukan", callback_data='tipe_pemasukan')],
@@ -218,7 +241,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.edit_message_text("Pilih:", reply_markup=InlineKeyboardMarkup(keyboard))
         return NOMINAL
-    
+
     elif query.data == 'cek':
         try:
             spreadsheet = setup_google_sheets()
@@ -234,7 +257,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 error_msg = "❌ Credentials tidak valid. Silakan perbarui di Render Secrets."
             else:
                 error_msg = f"❌ Error: {error_str[:100]}"
-            
+
             await query.edit_message_text(
                 error_msg,
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Kembali", callback_data='back')]])
@@ -254,7 +277,7 @@ async def tipe_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def get_nominal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text.strip().replace('.', '').replace(',', '').replace(' ', '').replace('Rp', '')
-    
+
     try:
         nominal = int(text)
         if nominal <= 0:
@@ -262,23 +285,23 @@ async def get_nominal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         temp_data[user_id]['nominal'] = nominal
         await update.message.reply_text("✅ Kirim keterangan:")
         return KETERANGAN
-    except:
+    except Exception:
         await update.message.reply_text("❌ Angka tidak valid. Coba lagi:")
         return NOMINAL
 
 async def get_keterangan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     keterangan = update.message.text.strip()
-    
+
     if len(keterangan) < 2:
         await update.message.reply_text("❌ Terlalu pendek:")
         return KETERANGAN
-    
+
     temp_data[user_id]['keterangan'] = keterangan
-    
+
     if temp_data[user_id]['tipe'] == 'pemasukan':
         return await save_transaction(update, context, user_id, "Pemasukan")
-    
+
     keyboard = [
         [InlineKeyboardButton("🍽 Makan", callback_data='cat_Makan')],
         [InlineKeyboardButton("🚬 Rokok", callback_data='cat_Rokok')],
@@ -299,26 +322,26 @@ async def get_kategori(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def save_transaction(update, context, user_id, kategori, edit_msg=None):
     data = temp_data[user_id]
-    
+
     try:
         spreadsheet = setup_google_sheets()
         worksheet = get_or_create_worksheet(spreadsheet)
-        
+
         row = [
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            datetime.now().strftime("%Y-%m-%d %H:%M"),  # tanggal jam menit, tanpa detik
             data['tipe'].capitalize(),
             data['nominal'],
             kategori,
             data['keterangan']
         ]
-        
+
         worksheet.append_row(row)
         logger.info(f"✅ Saved: {row}")
-        
+
         icon = "💰" if data['tipe'] == 'pemasukan' else "💸"
         nominal_fmt = f"Rp {data['nominal']:,}".replace(',', '.')
         msg = f"✅ *Tersimpan!*\n\n{icon} {data['tipe'].capitalize()}\n💵 {nominal_fmt}\n📁 {kategori}\n📝 {data['keterangan']}"
-        
+
     except Exception as e:
         logger.error(f"❌ Save error: {e}")
         error_str = str(e)
@@ -326,22 +349,22 @@ async def save_transaction(update, context, user_id, kategori, edit_msg=None):
             msg = "❌ *Gagal!*\n\nCredentials Google tidak valid. Hubungi admin untuk perbarui."
         else:
             msg = f"❌ *Gagal!*\n\n{error_str[:100]}"
-    
+
     if user_id in temp_data:
         del temp_data[user_id]
-    
+
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📝 Lagi", callback_data='lapor'),
          InlineKeyboardButton("🔙 Menu", callback_data='back')]
     ])
-    
+
     if edit_msg:
         await edit_msg(msg, parse_mode='Markdown', reply_markup=keyboard)
     else:
         await update.message.reply_text(msg, parse_mode='Markdown', reply_markup=keyboard)
-    
+
     context.user_data['last_saved_msg'] = msg
-    
+
     return ConversationHandler.END
 
 async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -350,9 +373,9 @@ async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id in temp_data:
         del temp_data[user_id]
-    keyboard = [[InlineKeyboardButton("📝 Lapor", callback_data='lapor')], 
+    keyboard = [[InlineKeyboardButton("📝 Lapor", callback_data='lapor')],
                 [InlineKeyboardButton("📊 Cek", callback_data='cek')]]
-    
+
     saved_msg = context.user_data.get('last_saved_msg')
     if saved_msg:
         try:
@@ -363,7 +386,7 @@ async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("💰 *Bot Keuangan*\n\nPilih menu:", parse_mode='Markdown',
                                        reply_markup=InlineKeyboardMarkup(keyboard))
     else:
-        await query.edit_message_text("💰 *Bot Keuangan*\n\nPilih menu:", parse_mode='Markdown', 
+        await query.edit_message_text("💰 *Bot Keuangan*\n\nPilih menu:", parse_mode='Markdown',
                                       reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -371,7 +394,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id in temp_data:
         del temp_data[user_id]
     context.user_data.pop('last_saved_msg', None)
-    await update.message.reply_text("❌ Dibatalkan.", 
+    await update.message.reply_text("❌ Dibatalkan.",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data='back')]]))
     return ConversationHandler.END
 
@@ -381,39 +404,16 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("⚠️ Error. Ketik /start untuk ulang.")
 
 # ============================================
-# MAIN
+# BOT SETUP (async, runs on bot_loop)
 # ============================================
-def main():
-    logger.info("=" * 60)
-    logger.info("🚀 BOT KEUANGAN STARTING")
-    logger.info("=" * 60)
-    
-    if not TELEGRAM_TOKEN:
-        logger.error("❌ TELEGRAM_TOKEN not set!")
-        return
-    
-    # Test Google Sheets
-    try:
-        logger.info("🔍 Testing Google Sheets...")
-        spreadsheet = setup_google_sheets()
-        worksheet = get_or_create_worksheet(spreadsheet)
-        logger.info(f"✅ Google Sheets OK: {spreadsheet.title}")
-    except Exception as e:
-        logger.error(f"❌ Google Sheets Error: {e}")
-        # Tetap lanjutkan agar bot bisa jalan
-    
-    # Start Flask
-    flask_thread = Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    logger.info(f"✅ Flask started on port {PORT}")
-    
-    # Start self-ping keep-alive
-    ping_thread = Thread(target=keep_alive, daemon=True)
-    ping_thread.start()
-    
-    # Setup bot
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-    
+async def setup_bot():
+    """Initialize PTB application and register webhook."""
+    global ptb_app
+
+    # Build application WITHOUT built-in updater (kita pakai webhook manual)
+    ptb_app = Application.builder().token(TELEGRAM_TOKEN).updater(None).build()
+
+    # Register handlers
     conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(button_handler, pattern='^lapor$')],
         states={
@@ -424,17 +424,74 @@ def main():
         },
         fallbacks=[CommandHandler('cancel', cancel)],
     )
-    
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(conv_handler)
-    application.add_handler(CallbackQueryHandler(back_to_menu, pattern='^back$'))
-    application.add_handler(CallbackQueryHandler(button_handler, pattern='^cek$'))
-    application.add_error_handler(error_handler)
-    
-    logger.info("✅ Bot running!")
+
+    ptb_app.add_handler(CommandHandler("start", start))
+    ptb_app.add_handler(conv_handler)
+    ptb_app.add_handler(CallbackQueryHandler(back_to_menu, pattern='^back$'))
+    ptb_app.add_handler(CallbackQueryHandler(button_handler, pattern='^cek$'))
+    ptb_app.add_error_handler(error_handler)
+
+    await ptb_app.initialize()
+    await ptb_app.start()
+
+    # Daftarkan webhook ke Telegram
+    if WEBHOOK_BASE_URL:
+        webhook_url = WEBHOOK_BASE_URL + '/webhook'
+        await ptb_app.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
+        logger.info(f"✅ Webhook registered: {webhook_url}")
+    else:
+        logger.error("❌ RENDER_EXTERNAL_URL not set! Webhook tidak bisa didaftarkan.")
+
+# ============================================
+# MAIN
+# ============================================
+def main():
     logger.info("=" * 60)
-    
-    application.run_polling(drop_pending_updates=True)
+    logger.info("🚀 BOT KEUANGAN STARTING (WEBHOOK MODE)")
+    logger.info("=" * 60)
+
+    if not TELEGRAM_TOKEN:
+        logger.error("❌ TELEGRAM_TOKEN not set!")
+        return
+
+    if not WEBHOOK_BASE_URL:
+        logger.error("❌ RENDER_EXTERNAL_URL not set!")
+        return
+
+    # Test Google Sheets di awal
+    try:
+        logger.info("🔍 Testing Google Sheets connection...")
+        spreadsheet = setup_google_sheets()
+        get_or_create_worksheet(spreadsheet)
+        logger.info(f"✅ Google Sheets OK: {spreadsheet.title}")
+    except Exception as e:
+        logger.error(f"❌ Google Sheets Error: {e}")
+        # Tetap lanjutkan agar bot bisa jalan
+
+    # Jalankan dedicated asyncio loop di background thread
+    loop_thread = Thread(target=run_bot_loop, daemon=True)
+    loop_thread.start()
+    logger.info("✅ Bot event loop started")
+
+    # Setup bot (initialize + register webhook) di bot_loop
+    future = asyncio.run_coroutine_threadsafe(setup_bot(), bot_loop)
+    try:
+        future.result(timeout=30)
+        logger.info("✅ Bot setup complete")
+    except Exception as e:
+        logger.error(f"❌ Bot setup failed: {e}")
+        return
+
+    # Start self-ping keep-alive
+    ping_thread = Thread(target=keep_alive, daemon=True)
+    ping_thread.start()
+
+    logger.info(f"✅ Flask starting on port {PORT}")
+    logger.info("=" * 60)
+
+    # Jalankan Flask (main thread)
+    flask_app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
+
 
 if __name__ == '__main__':
     main()
